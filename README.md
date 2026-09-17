@@ -7,6 +7,7 @@
 - **零转码重封装**：RTP 拆包 → NALU 重组 → FLV Tag 封装，CPU 开销极低
 - **H.264 / H.265**：H.264 输出标准 FLV（avcC SequenceHeader）；H.265 输出 Enhanced FLV（FourCC `hvc1` + hvcC）
 - **三种播放协议**：WS-FLV 与 HTTP-FLV 共用端口与路径、下发同一份 FLV 字节流，可混用；另有独立的 RTSP 转发端口
+- **播放**：使用jessibuca.js无插件进行播放
 - **RTSP 拉流 over TCP**：interleaved 模式，无需 UDP 端口；支持 Basic / Digest 认证
 - **RTSP 转发**：网关作为 RTSP 服务端，将已拉取的帧重新打包为 RTP（H.264 Single/FU-A、H.265 Single/FU），支持 TCP interleaved 与 UDP，关键帧前带内补发 VPS/SPS/PPS
 - **一路拉流多路分发**：同一 streamId 的多个客户端共享一个 RTSP 会话（单次启动保证）

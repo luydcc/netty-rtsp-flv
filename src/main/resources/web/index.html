@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>RTSP → FLV 播放测试（WebSocket / HTTP-FLV）</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+               margin: 0; padding: 24px; background: #14171c; color: #e6e6e6; }
+        h1 { font-size: 18px; margin: 0 0 16px; }
+        .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
+        label { font-size: 13px; color: #9aa4b2; }
+        input[type=text] { background: #1e232b; border: 1px solid #2c333d; color: #e6e6e6;
+                           padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+        input#streamId { width: 160px; }
+        input#token { width: 480px; }
+        select { background: #1e232b; border: 1px solid #2c333d; color: #e6e6e6;
+                 padding: 6px 8px; border-radius: 6px; font-size: 13px; }
+        button { background: #2f6feb; border: none; color: #fff; padding: 4px 16px;
+                 border-radius: 6px; font-size: 13px; cursor: pointer;}
+        button:hover { background: #3b7bff; }
+        button.stop { background: #444c58; }
+        button.stop:hover { background: #556; }
+        #container { width: 100%; max-width: 100%; height: calc(100vh - 210px); background: #000; border-radius: 8px; overflow: hidden; }
+        .info { margin-top: 12px; font-size: 13px; color: #9aa4b2; }
+        .info a { color: #58a6ff; }
+        code { background: #1e232b; padding: 1px 6px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+<h1>RTSP → FLV 播放测试（Jessibuca）</h1>
+<div class="bar">
+    <label for="proto">协议</label>
+    <select id="proto">
+        <option value="ws">ws-flv</option>
+        <option value="http">http-flv</option>
+    </select>
+    <label for="streamId">streamId</label>
+    <input type="text" id="streamId" value="cam1"/>
+    <label for="token">token</label>
+    <input type="text" id="token" placeholder="可选"/>
+    <button id="play">播放</button>
+    <button id="stop" class="stop">停止</button>
+    <label id="url"></label>
+</div>
+<div id="container"></div>
+<div class="info">
+    流状态看板：<a href="/streams.html" id="dashboard">/streams.html</a>
+    &nbsp;|&nbsp; 监控统计：<a href="/stats" target="_blank">/stats</a>
+    &nbsp;|&nbsp; 播放地址格式：<code>ws://&lt;host&gt;:&lt;port&gt;/live/{streamId}.flv?token=xxx</code>
+    、<code>http://&lt;host&gt;:&lt;port&gt;/live/{streamId}.flv?token=xxx</code>
+    、<code>rtsp://&lt;host&gt;:&lt;rtsp.forwardPort&gt;/live/{streamId}?token=xxx</code>
+    <br/>首次播放会在服务端触发一次 RTSP 拉流；多个客户端播放同一 streamId 复用同一条 RTSP（三种协议可混用）。
+    <br/>无客户端观看超过 <code>session.closeDelaySec</code> 秒后自动停止拉流，下次播放重新建流。
+</div>
+
+<script src="/jessibuca.js"></script>
+<script>
+    var player = null;
+    (function () {
+        var q = new URLSearchParams(location.search);
+        var sid = q.get('stream');
+        var tk = q.get('token');
+        var proto = q.get('proto');
+        if (sid) { document.getElementById('streamId').value = sid; }
+        if (proto === 'http' || proto === 'ws') { document.getElementById('proto').value = proto; }
+        if (tk) {
+            document.getElementById('token').value = tk;
+            document.getElementById('dashboard').href = '/streams.html?token=' + encodeURIComponent(tk);
+        }
+    })();
+
+    function buildUrl() {
+        var sid = document.getElementById('streamId').value.trim() || 'cam1';
+        var token = document.getElementById('token').value.trim();
+        var proto;
+        if (document.getElementById('proto').value === 'http') {
+            proto = location.protocol + '//'; // http-flv：与页面同源，chunked 长连接
+        } else {
+            proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        }
+        var url = proto + location.host + '/live/' + encodeURIComponent(sid) + '.flv';
+        if (token) { url += '?token=' + encodeURIComponent(token); }
+        return url;
+    }
+
+    function ensurePlayer() {
+        if (typeof Jessibuca === 'undefined') {
+            alert('Jessibuca 加载失败：请确认 /jessibuca.js 可访问');
+            return null;
+        }
+        if (player) { return player; }
+        player = new Jessibuca({
+            container: document.getElementById('container'),
+            decoder: '/decoder.js',
+            videoBuffer: 0.2,
+            isResize: true,
+            text: '',
+            loadingText: '加载中...',
+            debug: false,
+            showBandwidth: true,
+            operateBtns: { fullscreen: true, screenshot: true, play: true, audio: true },
+            forceNoOffscreen: false,
+            isNotMute: false,
+        });
+        player.on('error', function (e) { console.error('player error', e); });
+        return player;
+    }
+
+    document.getElementById('play').addEventListener('click', function () {
+        var p = ensurePlayer();
+        if (!p) { return; }
+        var url = buildUrl();
+        document.getElementById('url').textContent = '播放: ' + url;
+        p.play(url);
+    });
+
+    document.getElementById('stop').addEventListener('click', function () {
+        if (player) { player.pause(); }
+        document.getElementById('url').textContent = '';
+    });
+</script>
+</body>
+</html>

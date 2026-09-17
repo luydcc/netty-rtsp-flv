@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>流状态看板 · RTSP → FLV 网关</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+               margin: 0; padding: 24px; background: #14171c; color: #e6e6e6; }
+        h1 { font-size: 18px; margin: 0 0 4px; }
+        .sub a { color: #58a6ff; }
+        .cards { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+        .card { background: #1e232b; border: 1px solid #2c333d; border-radius: 8px;
+                padding: 10px 14px; min-width: 130px; }
+        .card .k { font-size: 11px; color: #9aa4b2; }
+        .card .v { font-size: 20px; font-weight: 600; margin-top: 2px; }
+        .panel { background: #1a1e25; border: 1px solid #2c333d; border-radius: 8px;
+                 padding: 14px; margin-bottom: 18px; }
+        .panel h2 { font-size: 14px; margin: 0 0 10px; }
+        .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+        label { font-size: 13px; color: #9aa4b2; }
+        input[type=text], select { background: #14171c; border: 1px solid #2c333d; color: #e6e6e6;
+                                   padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+        input#newId { width: 150px; }
+        input#newUrl { width: calc(100% - 348px); max-width: 100%; }
+        button { background: #2f6feb; border: none; color: #fff; padding: 4px 16px;
+                 border-radius: 6px; font-size: 13px; cursor: pointer; margin-top: -2px; }
+        button:hover { background: #3b7bff; }
+        button.ghost { background: #444c58; }
+        button.ghost:hover { background: #556; }
+        #msg { font-size: 13px; margin-top: 8px; min-height: 18px; }
+        #msg.ok { color: #6ee7b7; }
+        #msg.err { color: #ff7b72; }
+        code { background: #14171c; border: 1px solid #2c333d; padding: 3px 6px;
+               border-radius: 4px; font-size: 12px; color: #9aa4b2; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: center; padding: 8px 10px; border-bottom: 1px solid #232932;white-space: nowrap; }
+        th { color: #9aa4b2; font-weight: 500; font-size: 12px; background: #1a1e25; }
+        td.num { text-align: center; font-variant-numeric: tabular-nums; }
+        tr:hover td { background: #1e232b; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+        .b-idle { background: #2c333d; color: #9aa4b2; }
+        .b-starting { background: #4a3b12; color: #f0c674; }
+        .b-playing { background: #123f2a; color: #6ee7b7; }
+        .b-stopping { background: #4a2a12; color: #ffa657; }
+        .b-closed { background: #4a1a1a; color: #ff7b72; }
+        .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px;background: #2c333d; color: #9aa4b2; }
+        .tag.dyn { background: #23324a; color: #79b8ff; }
+        .url { color: #6b7480; font-size: 12px; text-align: left;}
+        a.play { color: #58a6ff; text-decoration: none; }
+        .empty { color: #6b7480; padding: 20px; text-align: center; }
+        .tablewrap { overflow-x: auto; }
+    </style>
+</head>
+<body>
+<h1>流状态看板</h1>
+<div class="cards">
+    <div class="card"><div class="k">已配置 / 临时流</div><div class="v" id="cStreams">-</div></div>
+    <div class="card"><div class="k">拉流中 / 上限</div><div class="v" id="cSessions">-</div></div>
+    <div class="card"><div class="k">在线客户端</div><div class="v" id="cClients">-</div></div>
+    <div class="card"><div class="k">RTSP 转发客户端</div><div class="v" id="cRtsp">-</div></div>
+    <div class="card"><div class="k">空闲自动断流</div><div class="v" id="cDelay">-</div></div>
+    <div class="card"><div class="k">网关运行</div><div class="v" id="cUptime">-</div></div>
+</div>
+
+<div class="panel">
+    <h2>临时添加流（仅存内存，网关重启后消失）,添加成功后即可播放：<code>ws://&lt;host&gt;:&lt;port&gt;/live/{streamId}.flv</code>
+        、<code>http://&lt;host&gt;:&lt;port&gt;/live/{streamId}.flv</code>
+        、<code>rtsp://&lt;host&gt;:&lt;rtsp.forwardPort&gt;/live/{streamId}</code></h2>
+    <div class="bar">
+        <label for="newId">streamId</label>
+        <input type="text" id="newId" placeholder="cam9" autocomplete="off"/>
+        <label for="newUrl">RTSP 地址</label>
+        <input type="text" id="newUrl" placeholder="rtsp://admin:pwd@ip:554/Streaming/Channels/101" autocomplete="off"/>
+        <button id="add">添加</button>
+    </div>
+    <div id="msg"></div>
+</div>
+
+<div class="panel">
+    <div class="bar" style="margin-bottom:10px;">
+        <h2 style="margin:0;flex:1;">流列表</h2>
+        <label for="interval">刷新</label>
+        <select id="interval">
+            <option value="1000">1 秒</option>
+            <option value="2000" selected>2 秒</option>
+            <option value="5000">5 秒</option>
+            <option value="10000">10 秒</option>
+        </select>
+        <button id="pause" class="ghost">暂停</button>
+        <button id="refresh" class="ghost">立即刷新</button>
+    </div>
+    <div class="tablewrap">
+        <table>
+            <thead>
+            <tr>
+                <th>流 ID</th>
+                <th>来源</th>
+                <th>RTSP 地址</th>
+                <th>拉流状态</th>
+                <th class="num">客户端</th>
+                <th class="num">RTSP 转发</th>
+                <th>编码</th>
+                <th class="num">入流量</th>
+                <th class="num">出流量</th>
+                <th class="num">帧数</th>
+                <th class="num">丢包</th>
+                <th class="num">GOP 缓存</th>
+                <th>创建时间</th>
+                <th class="num">已持续</th>
+                <th class="num">重连</th>
+                <th>操作</th>
+            </tr>
+            </thead>
+            <tbody id="rows">
+            <tr><td colspan="16" class="empty">加载中…</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    var token = new URLSearchParams(location.search).get('token') || '';
+    var timer = null;
+    var paused = false;
+    var prev = {};   // streamId -> {t, bytesIn, bytesOut}
+
+    function api(path) {
+        return path + (token ? (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(token) : '');
+    }
+
+    function esc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+            return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+        });
+    }
+
+    function bytes(n) {
+        if (n == null || n < 0) { return '-'; }
+        if (n < 1024) { return n + ' B'; }
+        var u = ['KB', 'MB', 'GB', 'TB'], i = -1, v = n;
+        do { v /= 1024; i++; } while (v >= 1024 && i < u.length - 1);
+        return v.toFixed(v >= 100 ? 0 : 1) + ' ' + u[i];
+    }
+
+    function rate(id, field, total, now) {
+        var p = prev[id];
+        if (!p || p[field] == null || total == null) { return ''; }
+        var dt = (now - p.t) / 1000;
+        if (dt <= 0.2) { return ''; }
+        var r = (total - p[field]) / dt;
+        return r > 0 ? ' · ' + bytes(Math.round(r)) + '/s' : '';
+    }
+
+    function dur(sec) {
+        if (sec == null || sec < 0) { return '-'; }
+        var d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
+            m = Math.floor(sec % 3600 / 60), s = Math.floor(sec % 60);
+        if (d > 0) { return d + '天 ' + h + '小时'; }
+        if (h > 0) { return h + '小时 ' + m + '分'; }
+        if (m > 0) { return m + '分 ' + s + '秒'; }
+        return s + '秒';
+    }
+
+    function clock(ms) {
+        if (!ms || ms < 0) { return '-'; }
+        var d = new Date(ms), p = function (n) { return n < 10 ? '0' + n : n; };
+        return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' +
+               p(d.getMinutes()) + ':' + p(d.getSeconds());
+    }
+
+    /** 带配额展示：配置了上限（>0）时显示 “当前 / 上限”。 */
+    function withLimit(n, max) {
+        return max > 0 ? n + ' / ' + max : String(n);
+    }
+
+    function pullState(s) {
+        if (!s.session) { return ['未拉流', 'b-idle']; }
+        switch (s.session.state) {
+            case 'PLAYING': return ['拉流中', 'b-playing'];
+            case 'STARTING': return ['连接中', 'b-starting'];
+            case 'STOPPING': return ['待关闭', 'b-stopping'];
+            case 'CLOSED': return ['已关闭', 'b-closed'];
+            default: return [s.session.state || 'IDLE', 'b-idle'];
+        }
+    }
+
+    function render(data) {
+        var now = data.now || Date.now();
+        var streams = data.streams || [];
+        var dyn = 0, clients = 0, rtspClients = 0;
+        streams.forEach(function (s) {
+            if (s.source === 'dynamic') { dyn++; }
+            if (s.session) {
+                clients += s.session.subscribers || 0;
+                rtspClients += s.session.rtspSubscribers || 0;
+            }
+        });
+        document.getElementById('cStreams').textContent = (streams.length - dyn) + ' / ' + dyn;
+        document.getElementById('cSessions').textContent =
+            withLimit(data.pulling == null ? data.sessions : data.pulling, data.maxPullStreams);
+        document.getElementById('cClients').textContent = clients;
+        document.getElementById('cRtsp').textContent = rtspClients;
+        document.getElementById('cDelay').textContent = data.closeDelaySec + ' 秒';
+        document.getElementById('cUptime').textContent = dur(Math.floor((now - data.startedAt) / 1000));
+
+        var tbody = document.getElementById('rows');
+        if (!streams.length) {
+            tbody.innerHTML = '<tr><td colspan="16" class="empty">没有配置任何流，' +
+                '请在 config.properties 添加 stream.&lt;id&gt;=&lt;rtsp url&gt; 或使用上方临时添加</td></tr>';
+        } else {
+            tbody.innerHTML = streams.map(function (s) {
+                var st = pullState(s), ss = s.session;
+                var inRate = ss ? rate(s.streamId, 'bytesIn', ss.bytesIn, now) : '';
+                var outRate = ss ? rate(s.streamId, 'bytesOut', ss.bytesOut, now) : '';
+                prev[s.streamId] = {t: now, bytesIn: ss ? ss.bytesIn : null, bytesOut: ss ? ss.bytesOut : null};
+                var playUrl = '/' + (token ? '?stream=' + encodeURIComponent(s.streamId) +
+                    '&token=' + encodeURIComponent(token) : '?stream=' + encodeURIComponent(s.streamId));
+                return '<tr>' +
+                    '<td><strong>' + esc(s.streamId) + '</strong></td>' +
+                    '<td><span class="tag' + (s.source === 'dynamic' ? ' dyn' : '') + '">' +
+                        (s.source === 'dynamic' ? '临时' : '配置') + '</span></td>' +
+                    '<td class="url">' + esc(s.rtspUrl) + '</td>' +
+                    '<td><span class="badge ' + st[1] + '">' + esc(st[0]) + '</span></td>' +
+                    '<td class="num">' + (ss ? ss.subscribers : 0) + '</td>' +
+                    '<td class="num">' + (ss && ss.rtspSubscribers ? ss.rtspSubscribers : 0) + '</td>' +
+                    '<td>' + (ss && ss.codec ? esc(ss.codec) : '-') + '</td>' +
+                    '<td class="num">' + (ss ? bytes(ss.bytesIn) + '<span class="url">' + inRate + '</span>' : '-') + '</td>' +
+                    '<td class="num">' + (ss ? bytes(ss.bytesOut) + '<span class="url">' + outRate + '</span>' : '-') + '</td>' +
+                    '<td class="num">' + (ss ? ss.framesIn : 0) + '</td>' +
+                    '<td class="num">' + (ss ? ss.rtpLost : 0) + (ss && ss.droppedFrames ? ' / 丢帧 ' + ss.droppedFrames : '') + '</td>' +
+                    '<td class="num">' + (ss ? bytes(ss.gopCacheBytes) + ' / ' + ss.gopCacheTags + ' 帧' : '-') + '</td>' +
+                    '<td>' + (ss ? clock(ss.createdAt) : '-') + '</td>' +
+                    '<td class="num">' + (ss ? dur(ss.uptimeSec) : '-') + '</td>' +
+                    '<td class="num">' + (ss ? ss.reconnects : 0) + '</td>' +
+                    '<td><a class="play" href="' + esc(playUrl) + '">播放</a></td>' +
+                    '</tr>';
+            }).join('');
+        }
+        document.getElementById('updated').textContent = '更新于 ' + clock(now);
+    }
+
+    function load() {
+        fetch(api('/api/streams'), {cache: 'no-store'})
+            .then(function (r) {
+                if (!r.ok) { throw new Error('HTTP ' + r.status); }
+                return r.json();
+            })
+            .then(render)
+            .catch(function (e) {
+                document.getElementById('updated').textContent = '刷新失败: ' + e.message;
+            });
+    }
+
+    function schedule() {
+        if (timer) { clearInterval(timer); }
+        timer = setInterval(function () { if (!paused) { load(); } },
+            parseInt(document.getElementById('interval').value, 10));
+    }
+
+    function showMsg(text, ok) {
+        var el = document.getElementById('msg');
+        el.textContent = text;
+        el.className = ok ? 'ok' : 'err';
+    }
+
+    document.getElementById('add').addEventListener('click', function () {
+        var id = document.getElementById('newId').value.trim();
+        var url = document.getElementById('newUrl').value.trim();
+        if (!id || !url) { showMsg('streamId 与 RTSP 地址都不能为空', false); return; }
+        fetch(api('/api/streams'), {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({streamId: id, url: url})
+        })
+            .then(function (r) { return r.json().then(function (j) { return {status: r.status, body: j}; }); })
+            .then(function (res) {
+                showMsg(res.body.message || res.body.error || ('HTTP ' + res.status), res.body.ok === true);
+                if (res.body.ok) {
+                    document.getElementById('newId').value = '';
+                    document.getElementById('newUrl').value = '';
+                    prev = {};
+                    load();
+                }
+            })
+            .catch(function (e) { showMsg('请求失败: ' + e.message, false); });
+    });
+
+    document.getElementById('newUrl').addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { document.getElementById('add').click(); }
+    });
+    document.getElementById('interval').addEventListener('change', schedule);
+    document.getElementById('refresh').addEventListener('click', load);
+    document.getElementById('pause').addEventListener('click', function () {
+        paused = !paused;
+        this.textContent = paused ? '继续' : '暂停';
+    });
+
+    load();
+    schedule();
+</script>
+</body>
+</html>
