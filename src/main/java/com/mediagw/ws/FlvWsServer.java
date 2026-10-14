@@ -1,6 +1,8 @@
 package com.mediagw.ws;
 
 import com.mediagw.config.GatewayConfig;
+import com.mediagw.gb28181.Gb28181Service;
+import com.mediagw.gb28181.GbFlvHandler;
 import com.mediagw.session.StreamSessionManager;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
@@ -26,8 +28,9 @@ import org.slf4j.LoggerFactory;
 /**
  * FLV over WebSocket / HTTP-FLV 服务端（两者共用同一端口与路径）。
  * Pipeline：HttpServerCodec -> CorsHandler(跨域预检与响应头) -> HttpObjectAggregator
- * -> HttpControlHandler(/stats、/api/streams、页面)
+ * -> HttpControlHandler(/stats、/api/streams、/api/gb28181/*、页面)
  * -> HttpFlvHandler(/live 普通 GET，chunked 下发 FLV)
+ * -> GbFlvHandler(/gb/live 国标通道 FLV)
  * -> WebSocketServerProtocolHandler(/live 前缀匹配) -> FlvWsHandler(订阅分发)。
  */
 public final class FlvWsServer {
@@ -36,6 +39,8 @@ public final class FlvWsServer {
 
     private final GatewayConfig config;
     private final StreamSessionManager manager;
+    /** 国标门面，可为 null（GB28181 未启用时不提供 /gb/live 播放）。 */
+    private final Gb28181Service gbService;
     /** 跨域配置不可变，各连接共用；CorsHandler 有状态，需每连接新建。 */
     private final CorsConfig corsConfig;
     private EventLoopGroup bossGroup;
@@ -43,8 +48,13 @@ public final class FlvWsServer {
     private Channel serverChannel;
 
     public FlvWsServer(GatewayConfig config, StreamSessionManager manager) {
+        this(config, manager, null);
+    }
+
+    public FlvWsServer(GatewayConfig config, StreamSessionManager manager, Gb28181Service gbService) {
         this.config = config;
         this.manager = manager;
+        this.gbService = gbService;
         this.corsConfig = buildCorsConfig(config);
     }
 
@@ -83,9 +93,14 @@ public final class FlvWsServer {
                                 // 跨域：需在聚合前处理，预检 OPTIONS 由此直接应答；WebSocket 握手响应也会带上跨域头
                                 .addLast(new CorsHandler(corsConfig))
                                 .addLast(new HttpObjectAggregator(64 * 1024))
-                                .addLast(new HttpControlHandler(manager, config))
+                                .addLast(new HttpControlHandler(manager, config, gbService))
                                 // HTTP-FLV：/live 的普通 GET（无 Upgrade 头）在此接管，升级请求继续下传
-                                .addLast(new HttpFlvHandler(manager, config))
+                                .addLast(new HttpFlvHandler(manager, config));
+                        // GB28181：/gb/live/<channelId>.flv 国标通道播放，未启用时不挂该环节
+                        if (gbService != null) {
+                            ch.pipeline().addLast(new GbFlvHandler(gbService, config));
+                        }
+                        ch.pipeline()
                                 // allowExtensions=false：视频流已压缩，禁用 permessage-deflate 省 CPU
                                 .addLast(new WebSocketServerProtocolHandler("/live", null, false, 65536, false, true))
                                 .addLast(new FlvWsHandler(manager, config));

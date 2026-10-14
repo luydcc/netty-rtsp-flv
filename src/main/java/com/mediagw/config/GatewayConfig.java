@@ -39,6 +39,15 @@ public final class GatewayConfig {
     private List<String> corsOrigins = List.of("*");
     private boolean corsAllowCredentials = false;
     private int corsMaxAgeSec = 3600;
+    private int gb28181Port = 5060;
+    private String gb28181ServerId = "34020000002000000001";
+    private String gb28181Realm = "";
+    private String gb28181Password = "";
+    private String gb28181MediaIp = "";
+    private int gb28181MediaPortStart = 30000;
+    private int gb28181MediaPortEnd = 30200;
+    private int gb28181StreamWaitSec = 15;
+    private int gb28181KeepaliveTimeoutSec = 180;
 
     public static GatewayConfig load(String path) {
         GatewayConfig cfg = new GatewayConfig();
@@ -74,6 +83,16 @@ public final class GatewayConfig {
         cfg.corsOrigins = parseOrigins(props.getProperty("server.corsOrigins"));
         cfg.corsAllowCredentials = boolProp(props, "server.corsAllowCredentials", cfg.corsAllowCredentials);
         cfg.corsMaxAgeSec = intProp(props, "server.corsMaxAgeSec", cfg.corsMaxAgeSec);
+        cfg.gb28181Port = intProp(props, "gb28181.port", cfg.gb28181Port);
+        cfg.gb28181ServerId = props.getProperty("gb28181.serverId", cfg.gb28181ServerId).trim();
+        cfg.gb28181Realm = props.getProperty("gb28181.realm", cfg.gb28181Realm).trim();
+        cfg.gb28181Password = props.getProperty("gb28181.password", "").trim();
+        cfg.gb28181MediaIp = props.getProperty("gb28181.mediaIp", cfg.gb28181MediaIp).trim();
+        cfg.gb28181MediaPortStart = intProp(props, "gb28181.mediaPortStart", cfg.gb28181MediaPortStart);
+        cfg.gb28181MediaPortEnd = intProp(props, "gb28181.mediaPortEnd", cfg.gb28181MediaPortEnd);
+        cfg.gb28181StreamWaitSec = intProp(props, "gb28181.streamWaitSec", cfg.gb28181StreamWaitSec);
+        cfg.gb28181KeepaliveTimeoutSec =
+                intProp(props, "gb28181.keepaliveTimeoutSec", cfg.gb28181KeepaliveTimeoutSec);
 
         Map<String, String> streams = new LinkedHashMap<>();
         for (String name : props.stringPropertyNames()) {
@@ -159,6 +178,23 @@ public final class GatewayConfig {
     public boolean corsAnyOrigin() { return corsOrigins.contains("*"); }
     public boolean corsAllowCredentials() { return corsAllowCredentials; }
     public int corsMaxAgeSec() { return corsMaxAgeSec; }
+    /** GB28181 SIP 信令监听端口（UDP+TCP），<=0 表示不启用。 */
+    public int gb28181Port() { return gb28181Port; }
+    /** 平台国标编码（20 位）。 */
+    public String gb28181ServerId() { return gb28181ServerId; }
+    /** SIP 鉴权域，空则默认取 serverId 前 10 位。 */
+    public String gb28181Realm() { return gb28181Realm; }
+    /** 设备接入密码，空表示注册不鉴权直接放行。 */
+    public String gb28181Password() { return gb28181Password; }
+    /** SDP 中告知设备的收流 IP，空则自动推断到设备可达的本机网卡地址。 */
+    public String gb28181MediaIp() { return gb28181MediaIp; }
+    /** RTP 收流端口范围（含端点）。 */
+    public int gb28181MediaPortStart() { return gb28181MediaPortStart; }
+    public int gb28181MediaPortEnd() { return gb28181MediaPortEnd; }
+    /** INVITE 成功后等待首个 RTP 包的秒数，超时判定收流失败。 */
+    public int gb28181StreamWaitSec() { return gb28181StreamWaitSec; }
+    /** 超过该秒数无任何注册/心跳视为设备离线。 */
+    public int gb28181KeepaliveTimeoutSec() { return gb28181KeepaliveTimeoutSec; }
 
     /** 日志脱敏：隐藏 RTSP URL 中的密码。 */
     public static String sanitizeUrl(String url) {

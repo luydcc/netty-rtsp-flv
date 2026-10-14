@@ -2,6 +2,7 @@ package com.mediagw.session;
 
 import com.mediagw.config.GatewayConfig;
 import com.mediagw.util.JsonBuilder;
+import com.mediagw.util.StreamUrl;
 import io.netty.channel.Channel;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
@@ -11,7 +12,6 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -169,7 +169,8 @@ public class StreamSessionManager {
             if (max > 0 && activeSessions() >= max) {
                 return null;
             }
-            StreamSession session = new StreamSession(streamId, url, config, this);
+            boolean ephemeral = config.streamUrl(streamId) == null && dynamicStreams.containsKey(streamId);
+            StreamSession session = new StreamSession(streamId, url, ephemeral, config, this);
             sessions.put(streamId, session);
             return session;
         }
@@ -220,8 +221,10 @@ public class StreamSessionManager {
         if (config.streamUrl(id) != null) {
             return new AddResult(false, "", "streamId '" + id + "' 与配置文件中的流冲突");
         }
-        if (!isRtspUrl(url)) {
-            return new AddResult(false,"", "非法 RTSP 地址，应形如 rtsp://[user:pass@]host[:port]/path");
+        if (!isRtspUrl(url) && !isHttpUrl(url)) {
+            return new AddResult(false, "", "非法流地址：RTSP 应形如 rtsp://[user:pass@]host[:port]/path，" +
+                    "HTTP 应形如 http://host[:port]/path（返 {\"url\":\"...\"} 的取流接口、"
+                    + "FLV 裸流与 1078 帧流均自动识别）");
         }
         int index = url.indexOf('?');
         if (index > 0) {
@@ -302,14 +305,16 @@ public class StreamSessionManager {
         return session != null && !session.isClosed();
     }
 
+    /** rtsp 地址：宽松解析，允许密码里带 # ? 等 URI 保留字符。 */
     private static boolean isRtspUrl(String url) {
-        URI uri;
-        try {
-            uri = URI.create(url);
-        } catch (IllegalArgumentException e) {
-            return false;
-        }
-        return "rtsp".equalsIgnoreCase(uri.getScheme()) && uri.getHost() != null;
+        StreamUrl uri = StreamUrl.parse(url);
+        return uri != null && "rtsp".equalsIgnoreCase(uri.scheme());
+    }
+
+    /** http/https 地址：代理拉流，按响应体前缀自动识别取流接口（JSON）、FLV 裸流（透传）与 JT1078 帧流。 */
+    private static boolean isHttpUrl(String url) {
+        StreamUrl uri = StreamUrl.parse(url);
+        return uri != null && uri.http();
     }
 
     /** 看板 JSON：全部已知流（配置 + 临时）及各自会话指标；无会话的流 session 为 null。 */

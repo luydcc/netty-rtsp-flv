@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GB28181 通道</title>
+    <style>
+        body { font-family: "Segoe UI", system-ui, sans-serif; margin: 0; background: #0f1420; color: #e6e9ef; }
+        header { display: flex; align-items: center; gap: 16px; padding: 14px 22px; background: #171e2e; border-bottom: 1px solid #263148; }
+        header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+        header a { color: #6ea8fe; font-size: 13px; text-decoration: none; }
+        .status { margin-left: auto; font-size: 12px; color: #8a94a6; }
+        .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #3fbf5f; margin-right: 5px; vertical-align: middle; }
+        .dot.off { background: #e05656; }
+        main { display: grid; grid-template-columns: 1fr 420px; gap: 18px; padding: 18px 22px; align-items: start; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; background: #141a28; border-radius: 8px; overflow: hidden; }
+        th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #222c42; }
+        th { background: #1b2334; color: #9aa6bd; font-weight: 500; }
+        tr:hover td { background: #192236; }
+        .dev { color: #6ea8fe; font-size: 12px; }
+        .badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; }
+        .badge.on { background: #143d24; color: #4fd07a; }
+        .badge.off { background: #3d1a1a; color: #e57373; }
+        button { cursor: pointer; border: 0; border-radius: 5px; padding: 5px 14px; font-size: 12px; color: #fff; background: #2f6fed; }
+        button.stop { background: #b4483f; }
+        button:disabled { background: #33405c; color: #7c869c; cursor: default; }
+        .panel { background: #141a28; border-radius: 8px; padding: 14px; position: sticky; top: 14px; }
+        #container { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; }
+        .now { font-size: 12px; color: #9aa6bd; margin: 10px 2px 0; word-break: break-all; min-height: 16px; }
+        .empty { text-align: center; padding: 40px; color: #5d6b86; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>GB28181 国标通道</h1>
+    <a href="/">← RTSP 测试页</a>
+    <a href="/streams.html">流看板</a>
+    <span class="status"><span id="conn" class="dot off"></span><span id="connText">未连接</span></span>
+</header>
+<main>
+    <section>
+        <table>
+            <thead>
+            <tr>
+                <th>通道</th>
+                <th>国标编码</th>
+                <th>厂商 / 型号</th>
+                <th>状态</th>
+                <th>操作</th>
+            </tr>
+            </thead>
+            <tbody id="rows">
+            <tr><td colspan="5" class="empty">暂无通道，等待设备注册与目录查询…</td></tr>
+            </tbody>
+        </table>
+    </section>
+    <aside class="panel">
+        <div id="container"></div>
+        <div class="now" id="now"></div>
+    </aside>
+</main>
+<script src="/jessibuca.js"></script>
+<script>
+    var TOKEN = new URLSearchParams(location.search).get('token') || '';
+    var player = null;
+    var playingChannel = null;
+
+    function api(path, body) {
+        var url = path + (TOKEN ? (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN) : '');
+        if (!body) { return fetch(url).then(function (r) { return r.json(); }); }
+        return fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        }).then(function (r) { return r.json(); });
+    }
+
+    function ensurePlayer() {
+        if (typeof Jessibuca === 'undefined') {
+            alert('Jessibuca 加载失败：请确认 /jessibuca.js 可访问');
+            return null;
+        }
+        if (player) { return player; }
+        player = new Jessibuca({
+            container: document.getElementById('container'),
+            decoder: '/decoder.js',
+            videoBuffer: 0.2,
+            isResize: true,
+            loadingText: '加载中...',
+            debug: false,
+            showBandwidth: true,
+            operateBtns: { fullscreen: true, screenshot: true, play: true, audio: true },
+            forceNoOffscreen: false,
+            isNotMute: false,
+        });
+        player.on('error', function (e) { console.error('player error', e); });
+        return player;
+    }
+
+    function flvUrl(channelId) {
+        var u = location.protocol + '//' + location.host + '/gb/live/' + encodeURIComponent(channelId) + '.flv';
+        if (TOKEN) { u += '?token=' + encodeURIComponent(TOKEN); }
+        return u;
+    }
+
+    function esc(s) {
+        return (s || '').replace(/[&<>"]/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+        });
+    }
+
+    function render(devices) {
+        var tbody = document.getElementById('rows');
+        var rows = [];
+        (devices || []).forEach(function (d) {
+            (d.channels || []).forEach(function (c) {
+                var online = c.deviceOnline;
+                var status = c.playing
+                    ? '<span class="badge on">播放中' + (c.viewers > 0 ? ' · ' + c.viewers + '人' : '') + '</span>'
+                    : (online ? '<span class="badge on">在线</span>' : '<span class="badge off">离线</span>');
+                var btn = c.playing
+                    ? '<button class="stop" data-stop="' + esc(c.channelId) + '">停止</button>'
+                    : '<button data-play="' + esc(c.channelId) + '" data-dev="' + esc(d.deviceId) + '"'
+                      + (online ? '' : ' disabled') + '>播放</button>';
+                rows.push('<tr>'
+                    + '<td>' + esc(c.name || '(未命名)') + '<div class="dev">' + esc(d.deviceId) + '</div></td>'
+                    + '<td><code>' + esc(c.channelId) + '</code></td>'
+                    + '<td>' + esc(c.manufacturer || '-') + ' / ' + esc(c.model || '-') + '</td>'
+                    + '<td>' + status + '</td>'
+                    + '<td>' + btn + '</td>'
+                    + '</tr>');
+            });
+        });
+        tbody.innerHTML = rows.length ? rows.join('')
+            : '<tr><td colspan="5" class="empty">暂无通道，等待设备注册与目录查询…</td></tr>';
+    }
+
+    function refresh() {
+        api('/api/gb28181/devices').then(render).catch(function (e) { console.error(e); });
+    }
+
+    // 事件委托：播放 / 停止
+    document.getElementById('rows').addEventListener('click', function (ev) {
+        var t = ev.target;
+        var playId = t.getAttribute && t.getAttribute('data-play');
+        var stopId = t.getAttribute && t.getAttribute('data-stop');
+        if (playId) {
+            var dev = t.getAttribute('data-dev');
+            t.disabled = true;
+            api('/api/gb28181/play', { deviceId: dev, channelId: playId }).then(function (r) {
+                if (!r.ok) { alert('点播失败: ' + r.error); refresh(); return; }
+                var p = ensurePlayer();
+                if (p) {
+                    playingChannel = playId;
+                    document.getElementById('now').textContent = '正在播放: ' + playId;
+                    p.play(flvUrl(playId));
+                }
+                setTimeout(refresh, 500);
+            });
+        } else if (stopId) {
+            api('/api/gb28181/stop', { channelId: stopId }).then(function () {
+                if (player && playingChannel === stopId) { player.pause(); playingChannel = null; document.getElementById('now').textContent = ''; }
+                refresh();
+            });
+        }
+    });
+
+    // 订阅设备/通道变更：SSE 到达即刷新列表
+    function subscribe() {
+        var es = new EventSource('/api/gb28181/events' + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : ''));
+        es.onopen = function () {
+            document.getElementById('conn').className = 'dot';
+            document.getElementById('connText').textContent = '实时订阅中';
+        };
+        es.onmessage = function () { refresh(); };
+        es.onerror = function () {
+            document.getElementById('conn').className = 'dot off';
+            document.getElementById('connText').textContent = '连接断开，重连中…';
+            es.close();
+            setTimeout(subscribe, 3000);
+        };
+    }
+
+    refresh();
+    subscribe();
+    setInterval(refresh, 10000); // 兜底轮询
+</script>
+</body>
+</html>

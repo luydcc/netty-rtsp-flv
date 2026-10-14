@@ -22,7 +22,7 @@ public class GlobalSocks5ProxyConfig {
         try {
             props.load(new FileInputStream(proxyFile));
             props.forEach((k,v)->{
-                if(k.toString().endsWith("sock5.proxy.")) {
+                if(k.toString().startsWith("sock5.proxy.")) {
                     addProxy(v.toString());
                 }
             });
@@ -80,42 +80,45 @@ public class GlobalSocks5ProxyConfig {
         }
     }
     public static Socks5ProxyHandler getSocks5ProxyHandler(String host) {
-        String[] arr=host.split("\\.");
+        List<Proxy> matched = selectProxies(host);
+        if(matched==null||matched==NO_PROXY) {
+            return null;
+        }
+        InetSocketAddress proxyAddress = (InetSocketAddress) matched.getFirst().address();
+        PasswordAuthentication auth = PROXY_AUTH.get(proxyAddress.getHostString()+":"+proxyAddress.getPort());
+        if(auth!=null){
+            return new Socks5ProxyHandler(proxyAddress, auth.getUserName(), new String(auth.getPassword()));
+        }
+        return new Socks5ProxyHandler(proxyAddress);
+    }
+    /** 4 段逐级匹配：模式段为 "*" 或与实际地址段相同才算命中，必须全部段都命中。 */
+    private static List<Proxy> selectProxies(String hostOrAddr) {
+        String[] arr=hostOrAddr.split("\\.");
         for(Map.Entry<String[],List<Proxy>> entry:ALL_PROXY.entrySet()) {
             String[] checkArr=entry.getKey();
-            if(arr.length==checkArr.length) {
-                for(int i=0;i<arr.length;i++) {
-                    if(arr[i].equals(ALL_MATCH_IP)||arr[i].equals(checkArr[i])) {
-                        SocketAddress proxyAddress = entry.getValue().getFirst().address();
-                        PasswordAuthentication auth = PROXY_AUTH.get(proxyAddress.toString().substring(1));
-                        if(auth!=null){
-                            return new Socks5ProxyHandler(proxyAddress, auth.getUserName(), new String(auth.getPassword()));
-                        }
-                        return new Socks5ProxyHandler(proxyAddress);
-                    }
+            if(arr.length!=checkArr.length) {
+                continue;
+            }
+            boolean matched=true;
+            for(int i=0;i<arr.length;i++) {
+                if(!checkArr[i].equals(ALL_MATCH_IP)&&!checkArr[i].equals(arr[i])) {
+                    matched=false;
+                    break;
                 }
             }
+            if(matched) {
+                return entry.getValue();
+            }
         }
-        return null;
+        // ip地址匹配规则，分成4级匹配，如果最后一位有/，则全匹配，通常是/24才是这个匹配，这里简化了
+        return NO_PROXY;
     }
     private static void startConfig() {
         System.setProperty("socksProxyVersion", "5");
         ProxySelector.setDefault(new ProxySelector() {
             @Override
             public List<Proxy> select(URI uri) {
-                String[] arr=uri.getHost().split("\\.");
-                for(Map.Entry<String[],List<Proxy>> entry:ALL_PROXY.entrySet()) {
-                    String[] checkArr=entry.getKey();
-                    if(arr.length==checkArr.length) {
-                        for(int i=0;i<arr.length;i++) {
-                            if(arr[i].equals(ALL_MATCH_IP)||arr[i].equals(checkArr[i])) {
-                                return entry.getValue();
-                            }
-                        }
-                    }
-                }
-                // ip地址匹配规则，分成4级匹配，如果最后一位有/，则全匹配，通常是/24才是这个匹配，这里简化了
-                return NO_PROXY;
+                return selectProxies(uri.getHost());
             }
             @Override
             public void connectFailed(URI uri, SocketAddress sa, IOException ioe) {

@@ -4,6 +4,7 @@ import com.mediagw.codec.VideoDepacketizer;
 import com.mediagw.config.GatewayConfig;
 import com.mediagw.config.GlobalSocks5ProxyConfig;
 import com.mediagw.rtp.RtpPacket;
+import com.mediagw.util.StreamUrl;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
@@ -16,7 +17,6 @@ import io.netty.handler.timeout.IdleStateHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.URI;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ScheduledFuture;
@@ -92,35 +92,16 @@ public class RtspClient {
     private boolean lastWithSession;
 
     public RtspClient(String url, GatewayConfig config, EventLoopGroup group, Listener listener) {
-        URI uri;
-        try {
-            uri = URI.create(url);
-        } catch (IllegalArgumentException e) {
-            throw new RtspException("invalid RTSP URL: " + GatewayConfig.sanitizeUrl(url), e);
-        }
-        if (!"rtsp".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null) {
+        // 不用 URI.create：密码里的 # ? 会被当作 fragment/query 截断，改用宽松解析
+        StreamUrl uri = StreamUrl.parse(url);
+        if (uri == null || !"rtsp".equalsIgnoreCase(uri.scheme())) {
             throw new RtspException("invalid RTSP URL: " + GatewayConfig.sanitizeUrl(url));
         }
-        this.host = uri.getHost();
-        this.port = uri.getPort() > 0 ? uri.getPort() : 554;
-        String path = uri.getRawPath() == null || uri.getRawPath().isEmpty() ? "/" : uri.getRawPath();
-        if (uri.getRawQuery() != null) {
-            path = path + "?" + uri.getRawQuery();
-        }
-        this.requestUrl = "rtsp://" + host + (uri.getPort() > 0 ? ":" + port : "") + path;
-        String u = null;
-        String p = null;
-        if (uri.getUserInfo() != null && !uri.getUserInfo().isEmpty()) {
-            int colon = uri.getUserInfo().indexOf(':');
-            if (colon >= 0) {
-                u = uri.getUserInfo().substring(0, colon);
-                p = uri.getUserInfo().substring(colon + 1);
-            } else {
-                u = uri.getUserInfo();
-            }
-        }
-        this.user = u;
-        this.password = p;
+        this.host = uri.host();
+        this.port = uri.portExplicit() ? uri.port() : 554;
+        this.requestUrl = uri.requestUrl();
+        this.user = uri.user();
+        this.password = uri.password();
         this.config = config;
         this.group = group;
         this.listener = listener;

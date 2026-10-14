@@ -1,6 +1,7 @@
 package com.mediagw.ws;
 
 import com.mediagw.config.GatewayConfig;
+import com.mediagw.gb28181.Gb28181Service;
 import com.mediagw.session.StreamSessionManager;
 import com.mediagw.util.JsonBuilder;
 import io.netty.buffer.Unpooled;
@@ -8,11 +9,13 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.DefaultHttpResponse;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
@@ -31,7 +34,8 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * HTTP 控制通道：{@code /stats} 与 {@code /api/streams} 监控 JSON、
  * {@code /api/streams} POST 临时添加流、{@code /} 测试页与 {@code /streams.html} 看板；
- * {@code /live*} 的播放请求透传给下游 HttpFlvHandler / WebSocketServerProtocolHandler。
+ * {@code /api/gb28181/*} 国标设备/通道查询、点播/停流与 SSE 变更推送；
+ * {@code /live*} 与 {@code /gb/*} 的播放请求透传给下游 HttpFlvHandler / GbFlvHandler / WebSocket。
  */
 public final class HttpControlHandler extends ChannelInboundHandlerAdapter {
 
@@ -43,16 +47,24 @@ public final class HttpControlHandler extends ChannelInboundHandlerAdapter {
             "/decoder.js", new String[]{"/web/decoder.js", "application/javascript; charset=utf-8"},
             "/decoder.wasm", new String[]{"/web/decoder.wasm", "application/wasm"},
             "/index.html", new String[]{"/web/index.html", "text/html; charset=utf-8"},
-            "/streams.html", new String[]{"/web/streams.html", "text/html; charset=utf-8"}
+            "/streams.html", new String[]{"/web/streams.html", "text/html; charset=utf-8"},
+            "/gb_channels.html", new String[]{"/web/gb_channels.html", "text/html; charset=utf-8"}
     );
 
     private final StreamSessionManager manager;
     private final GatewayConfig config;
+    /** 国标门面，可为 null（GB28181 未启用时相关接口返回 503）。 */
+    private final Gb28181Service gbService;
     private final Map<String, byte[]> resourceCache = new ConcurrentHashMap<>();
 
     public HttpControlHandler(StreamSessionManager manager, GatewayConfig config) {
+        this(manager, config, null);
+    }
+
+    public HttpControlHandler(StreamSessionManager manager, GatewayConfig config, Gb28181Service gbService) {
         this.manager = manager;
         this.config = config;
+        this.gbService = gbService;
     }
 
     @Override
@@ -62,8 +74,8 @@ public final class HttpControlHandler extends ChannelInboundHandlerAdapter {
             return;
         }
         String path = new QueryStringDecoder(req.uri()).path();
-        if (path.startsWith("/live")) {
-            ctx.fireChannelRead(req); // 交给 HTTP-FLV / WebSocket 处理，勿释放
+        if (path.startsWith("/live") || path.startsWith("/gb/")) {
+            ctx.fireChannelRead(req); // 交给 HTTP-FLV / GB-FLV / WebSocket 处理，勿释放
             return;
         }
         try {
@@ -72,7 +84,9 @@ public final class HttpControlHandler extends ChannelInboundHandlerAdapter {
                 case "/api/streams" -> handleStreamsApi(ctx, req);
                 case "/" -> sendStatic(ctx, req, "/index.html");
                 default -> {
-                    if (STATIC_FILES.containsKey(path)) {
+                    if (path.startsWith("/api/gb28181/")) {
+                        handleGbApi(ctx, req, path);
+                    } else if (STATIC_FILES.containsKey(path)) {
                         sendStatic(ctx, req, path);
                     } else {
                         sendText(ctx, req, HttpResponseStatus.NOT_FOUND);
@@ -82,6 +96,98 @@ public final class HttpControlHandler extends ChannelInboundHandlerAdapter {
         } finally {
             req.release();
         }
+    }
+
+    // ===== /api/gb28181/* =====
+
+    private void handleGbApi(ChannelHandlerContext ctx, FullHttpRequest req, String path) {
+        if (gbService == null) {
+            sendJson(ctx, req, HttpResponseStatus.SERVICE_UNAVAILABLE,
+                    "{\"ok\":false,\"error\":\"GB28181 未启用\"}");
+            return;
+        }
+        if (!authorized(req)) {
+            sendJson(ctx, req, HttpResponseStatus.UNAUTHORIZED,
+                    "{\"ok\":false,\"error\":\"token 校验失败\"}");
+            return;
+        }
+        switch (path) {
+            case "/api/gb28181/devices" -> {
+                if (HttpMethod.GET.equals(req.method())) {
+                    sendJson(ctx, req, HttpResponseStatus.OK, gbService.devicesJson());
+                } else {
+                    sendText(ctx, req, HttpResponseStatus.METHOD_NOT_ALLOWED);
+                }
+            }
+            case "/api/gb28181/play" -> gbPlay(ctx, req);
+            case "/api/gb28181/stop" -> gbStop(ctx, req);
+            case "/api/gb28181/events" -> gbSse(ctx, req);
+            default -> sendText(ctx, req, HttpResponseStatus.NOT_FOUND);
+        }
+    }
+
+    /** POST {"deviceId":..,"channelId":..}：发起 INVITE 点播，流异步到达。 */
+    private void gbPlay(ChannelHandlerContext ctx, FullHttpRequest req) {
+        if (!HttpMethod.POST.equals(req.method())) {
+            sendText(ctx, req, HttpResponseStatus.METHOD_NOT_ALLOWED);
+            return;
+        }
+        String body = req.content().toString(StandardCharsets.UTF_8);
+        String deviceId = jsonField(body, "deviceId");
+        String channelId = jsonField(body, "channelId");
+        if (channelId == null) {
+            sendJson(ctx, req, HttpResponseStatus.BAD_REQUEST,
+                    "{\"ok\":false,\"error\":\"请求体需包含 channelId\"}");
+            return;
+        }
+        String error = gbService.play(deviceId == null ? "" : deviceId, channelId);
+        if (error != null) {
+            log.warn("[GB28181] 点播失败: channel={}, {}", channelId, error);
+            sendJson(ctx, req, HttpResponseStatus.BAD_REQUEST,
+                    "{\"ok\":false,\"error\":" + JsonBuilder.str(error) + "}");
+            return;
+        }
+        sendJson(ctx, req, HttpResponseStatus.OK,
+                "{\"ok\":true,\"flvUrl\":" + JsonBuilder.str("/gb/live/" + channelId + ".flv")
+                        + ",\"tokenRequired\":" + (!config.authToken().isEmpty()) + "}");
+    }
+
+    private void gbStop(ChannelHandlerContext ctx, FullHttpRequest req) {
+        if (!HttpMethod.POST.equals(req.method())) {
+            sendText(ctx, req, HttpResponseStatus.METHOD_NOT_ALLOWED);
+            return;
+        }
+        String channelId = jsonField(req.content().toString(StandardCharsets.UTF_8), "channelId");
+        if (channelId == null) {
+            sendJson(ctx, req, HttpResponseStatus.BAD_REQUEST,
+                    "{\"ok\":false,\"error\":\"请求体需包含 channelId\"}");
+            return;
+        }
+        gbService.stop(channelId);
+        sendJson(ctx, req, HttpResponseStatus.OK, "{\"ok\":true}");
+    }
+
+    /** SSE 事件流：chunked text/event-stream，存储/播放变化时推送 data: 行。 */
+    private void gbSse(ChannelHandlerContext ctx, FullHttpRequest req) {
+        if (!HttpMethod.GET.equals(req.method())) {
+            sendText(ctx, req, HttpResponseStatus.METHOD_NOT_ALLOWED);
+            return;
+        }
+        HttpResponse resp = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+        resp.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/event-stream; charset=utf-8");
+        resp.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+        resp.headers().set(HttpHeaderNames.CACHE_CONTROL, "no-cache, no-transform");
+        resp.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
+        ctx.writeAndFlush(resp);
+        gbService.addSseClient(ctx.channel());
+    }
+
+    @Override
+    public void channelUnregistered(ChannelHandlerContext ctx) throws Exception {
+        if (gbService != null) {
+            gbService.removeSseClient(ctx.channel());
+        }
+        super.channelUnregistered(ctx);
     }
 
     // ===== /api/streams =====

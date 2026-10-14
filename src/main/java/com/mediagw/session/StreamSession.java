@@ -8,6 +8,10 @@ import com.mediagw.codec.ParamSets;
 import com.mediagw.codec.VideoDepacketizer;
 import com.mediagw.config.GatewayConfig;
 import com.mediagw.flv.FlvMuxer;
+import com.mediagw.flv.FlvPassthroughParser;
+import com.mediagw.flv.FlvTagKind;
+import com.mediagw.flv.StreamBodyParser;
+import com.mediagw.jt1078.Jt1078HttpPullClient;
 import com.mediagw.rtsp.RtspClient;
 import com.mediagw.rtsp.SdpInfo;
 import com.mediagw.util.JsonBuilder;
@@ -39,8 +43,10 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * 输出分两类，共享同一路拉流与会话生命周期：
  * FLV 订阅者（WebSocket / HTTP-FLV）收 FLV Tag；原始帧订阅者（RTSP 转发）收访问单元。
+ * http/https 上游按响应体前缀区分：FLV Header 开头则为普通视频（零转码透传 FLV Tag，
+ * 无访问单元故不参与 RTSP 转发），否则按 JT/T 1078 帧流重组 H.264 后封装 FLV。
  */
-public class StreamSession implements VideoDepacketizer.Listener {
+public class StreamSession implements VideoDepacketizer.Listener, FlvPassthroughParser.Listener {
 
     private static final Logger log = LoggerFactory.getLogger(StreamSession.class);
 
@@ -48,6 +54,14 @@ public class StreamSession implements VideoDepacketizer.Listener {
     private static final WebSocketCloseStatus CLOSE_SHUTDOWN = new WebSocketCloseStatus(1001, "server shutting down");
     /** 关键帧连续 N 次遇到 Channel 不可写则判定为慢消费者并断开。 */
     private static final int MAX_KEYFRAME_NOT_WRITABLE_STREAK = 3;
+    /** JT1078 代理拉流中断后的最大重连次数，用尽则关闭会话。 */
+    private static final int JT1078_MAX_RECONNECTS = 3;
+    /** 取流接口未给出流地址时的重试间隔。 */
+    private static final long URL_RETRY_DELAY_MS = 1000L;
+    /** 取流接口连续取不到流地址的最大尝试次数，用尽则判定启动失败。 */
+    private static final int URL_FETCH_MAX_ATTEMPTS = 5;
+    /** 接口给出的地址又是接口时的跳转上限（防接口互相指向）。 */
+    private static final int URL_MAX_HOPS = 3;
 
     public enum State { IDLE, STARTING, PLAYING, STOPPING, CLOSED }
 
@@ -65,6 +79,7 @@ public class StreamSession implements VideoDepacketizer.Listener {
     private CompletableFuture<Void> startFuture;      // guarded by this
     private ScheduledFuture<?> pendingCloseFuture;    // guarded by this
     private RtspClient rtspClient;                    // guarded by this
+    private Jt1078HttpPullClient jt1078Client;        // guarded by this
     private volatile FlvMuxer muxer;
     private volatile VideoDepacketizer depacketizer;
     /** 最新参数集，用于 RTSP 转发的 SDP 生成与带内参数集插入。 */
@@ -76,6 +91,25 @@ public class StreamSession implements VideoDepacketizer.Listener {
 
     private int reconnectAttempts;      // guarded by this
     private boolean reconnectScheduled; // guarded by this
+
+    /** 代理拉流（http/https 上游，按响应体前缀自动识别取流接口 / 1078 帧流 / FLV 裸流）。 */
+    private volatile boolean jt1078;
+    /** 配置地址是取流接口：响应体是 JSON，每轮拉流（含重连）前先解析出真实流地址。 */
+    private volatile boolean urlApiMode;
+    /** 取流接口给出的真实流地址（guarded by this）；接口模式下每轮重新解析，不长期沿用。 */
+    private String pullUrl;                       // guarded by this
+    /** 取流接口连续未取到地址的尝试次数（guarded by this）。 */
+    private int urlAttempts;                      // guarded by this
+    /** 本轮拉流已发生的接口跳转次数，防止接口互相指向导致快速循环（guarded by this）。 */
+    private int urlHops;                          // guarded by this
+    /** FLV 裸流透传模式：上游已是标准 FLV，不经 {@link FlvMuxer} 重新封装。 */
+    private volatile boolean flvPassthrough;
+    /** 透传模式首屏缓存：上游 FLV Header 与音/视频解码配置 Tag（guarded by this）。 */
+    private ByteBuf flvHeaderTag;
+    private ByteBuf flvVideoConfigTag;
+    private ByteBuf flvAudioConfigTag;
+    /** 接口临时添加的流：无人观看立即删除，不做延迟关闭。 */
+    private final boolean ephemeral;
 
     // ===== 监控指标 =====
     private final AtomicLong framesIn = new AtomicLong();
@@ -91,9 +125,12 @@ public class StreamSession implements VideoDepacketizer.Listener {
     private volatile long playingSinceMs = -1;
     private volatile long lastFrameAtMs = -1;
 
-    StreamSession(String streamId, String rtspUrl, GatewayConfig config, StreamSessionManager manager) {
+    StreamSession(String streamId, String rtspUrl, boolean ephemeral, GatewayConfig config,
+                  StreamSessionManager manager) {
         this.streamId = streamId;
         this.rtspUrl = rtspUrl;
+        this.ephemeral = ephemeral;
+        this.jt1078 = isHttpUrl(rtspUrl);
         this.config = config;
         this.manager = manager;
         this.gopCache = new GopCache(config.gopCacheMaxBytes());
@@ -223,6 +260,9 @@ public class StreamSession implements VideoDepacketizer.Listener {
     }
 
     private void logLastSubscriberLeft(boolean closeScheduled) {
+        if (ephemeral) {
+            return; // 临时流已在关闭处记录
+        }
         if (closeScheduled) {
             log.info("[{}] last subscriber left, closing RTSP in {}s", streamId, config.closeDelaySec());
         } else {
@@ -392,6 +432,15 @@ public class StreamSession implements VideoDepacketizer.Listener {
      */
     private boolean onLastSubscriberLeftLocked() {
         if (state == State.PLAYING) {
+            if (ephemeral) {
+                // 接口临时添加的流不保留缓存：无人观看立即终止会话
+                state = State.CLOSED;
+                closePullerLocked();
+                cleanupMediaLocked();
+                manager.removeSession(streamId, this);
+                log.info("[{}] last subscriber left, ephemeral session closed immediately", streamId);
+                return true;
+            }
             state = State.STOPPING;
             pendingCloseFuture = manager.scheduler().schedule(
                     this::delayedClose, config.closeDelaySec(), TimeUnit.SECONDS);
@@ -406,7 +455,7 @@ public class StreamSession implements VideoDepacketizer.Listener {
             pendingCloseFuture = null;
             if (totalSubscribersLocked() == 0 && state == State.STOPPING) {
                 state = State.CLOSED;
-                closeRtspLocked();
+                closePullerLocked();
                 cleanupMediaLocked();
                 manager.removeSession(streamId, this);
                 log.info("[{}] session closed after {}s without subscribers", streamId, config.closeDelaySec());
@@ -421,14 +470,27 @@ public class StreamSession implements VideoDepacketizer.Listener {
         synchronized (this) {
             ok = state != State.CLOSED;
             if (ok) {
-                snapshot.add(Unpooled.wrappedBuffer(FlvMuxer.FLV_HEADER));
-                FlvMuxer m = muxer;
-                if (m != null) {
-                    ByteBuf cfg = m.buildConfigTag();
-                    if (cfg != null) {
-                        snapshot.add(cfg);
+                if (flvPassthrough) {
+                    // 透传模式：上游 Header + 音/视频配置 Tag + 最近 GOP
+                    snapshot.add(flvHeaderTag != null ? flvHeaderTag.retainedDuplicate()
+                            : Unpooled.wrappedBuffer(FlvMuxer.FLV_HEADER));
+                    if (flvVideoConfigTag != null) {
+                        snapshot.add(flvVideoConfigTag.retainedDuplicate());
+                    }
+                    if (flvAudioConfigTag != null) {
+                        snapshot.add(flvAudioConfigTag.retainedDuplicate());
                     }
                     gopCache.snapshotTo(snapshot);
+                } else {
+                    snapshot.add(Unpooled.wrappedBuffer(FlvMuxer.FLV_HEADER));
+                    FlvMuxer m = muxer;
+                    if (m != null) {
+                        ByteBuf cfg = m.buildConfigTag();
+                        if (cfg != null) {
+                            snapshot.add(cfg);
+                        }
+                        gopCache.snapshotTo(snapshot);
+                    }
                 }
             }
         }
@@ -457,13 +519,35 @@ public class StreamSession implements VideoDepacketizer.Listener {
         bootstrapTotalMs.addAndGet(sub.bootstrappedAtMs() - sub.subscribedAtMs());
     }
 
-    // ===== RTSP 生命周期 =====
+    // ===== 拉流生命周期 =====
 
+    /**
+     * 启动拉流。配置地址是取流接口时，每轮（含重连）都重新请求接口——接口给出的
+     * 可能是带时效签名的临时地址；否则沿用已解析出的地址。
+     */
     private void startRtsp() {
+        String url;
+        synchronized (this) {
+            url = urlApiMode || pullUrl == null ? rtspUrl : pullUrl;
+            urlHops = 0; // 新一轮拉流，跳转计数重新计
+        }
+        startPull(url);
+    }
+
+    /** 按地址协议选择上游：http(s) 走代理拉流（自动识别取流接口 / 1078 / FLV），其余按 RTSP。 */
+    private void startPull(String url) {
+        if (isHttpUrl(url)) {
+            startJt1078(url);
+        } else {
+            startRtspClient(url);
+        }
+    }
+
+    private void startRtspClient(String url) {
         RtspListener listener = new RtspListener();
         RtspClient client;
         try {
-            client = new RtspClient(rtspUrl, config, manager.rtspGroup(), listener);
+            client = new RtspClient(url, config, manager.rtspGroup(), listener);
         } catch (RuntimeException e) {
             listener.onStartupFailure(e);
             return;
@@ -474,9 +558,64 @@ public class StreamSession implements VideoDepacketizer.Listener {
                 return;
             }
             rtspClient = client;
+            jt1078 = false;
         }
-        log.info("[{}] starting RTSP: {}", streamId, GatewayConfig.sanitizeUrl(rtspUrl));
+        log.info("[{}] starting RTSP: {}", streamId, GatewayConfig.sanitizeUrl(url));
         client.start();
+    }
+
+    /** HTTP 拉流：响应体是 JSON 先解析流地址，前缀为 FLV Header 则零转码透传，否则按 1078 帧流封装。 */
+    private void startJt1078(String url) {
+        Jt1078Listener listener = new Jt1078Listener();
+        Jt1078HttpPullClient client;
+        try {
+            client = new Jt1078HttpPullClient(url, config, manager.rtspGroup(), listener);
+        } catch (RuntimeException e) {
+            listener.onStartupFailure(e);
+            return;
+        }
+        synchronized (this) {
+            if (state == State.CLOSED) {
+                client.stop();
+                return;
+            }
+            jt1078Client = client;
+            jt1078 = true;
+        }
+        log.info("[{}] starting HTTP pull (api / JT1078 / FLV auto-detect): {}",
+                streamId, GatewayConfig.sanitizeUrl(url));
+        client.start();
+    }
+
+    /** 取流接口未给出地址：延迟 {@link #URL_RETRY_DELAY_MS} 后重新请求，次数用尽则判定启动失败。 */
+    private void scheduleUrlRetry() {
+        int attempt;
+        synchronized (this) {
+            if (state == State.CLOSED) {
+                return;
+            }
+            attempt = ++urlAttempts;
+        }
+        if (attempt > URL_FETCH_MAX_ATTEMPTS) {
+            log.warn("[{}] stream url api gave no address {} times, giving up", streamId, URL_FETCH_MAX_ATTEMPTS);
+            handleStartupFailure(new IllegalStateException("no stream url from api after "
+                    + URL_FETCH_MAX_ATTEMPTS + " attempts"));
+            return;
+        }
+        log.warn("[{}] no stream url in api response, retry {}/{} in {}ms",
+                streamId, attempt, URL_FETCH_MAX_ATTEMPTS, URL_RETRY_DELAY_MS);
+        manager.scheduler().schedule(() -> {
+            synchronized (this) {
+                if (state == State.CLOSED) {
+                    return;
+                }
+            }
+            startRtsp(); // 接口模式：重新请求取流接口
+        }, URL_RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private static boolean isHttpUrl(String url) {
+        return url.startsWith("http://") || url.startsWith("https://");
     }
 
     private void scheduleReconnect() {
@@ -487,6 +626,12 @@ public class StreamSession implements VideoDepacketizer.Listener {
             attempt = reconnectAttempts;
             delayMs = Math.min(1000L << Math.min(attempt - 1, 5), 30_000L);
             reconnects.incrementAndGet();
+        }
+        if (jt1078 && attempt > JT1078_MAX_RECONNECTS) {
+            log.warn("[{}] JT1078 reconnect failed {} times, giving up", streamId, JT1078_MAX_RECONNECTS);
+            handleStartupFailure(new IllegalStateException(
+                    "JT1078 pull failed after " + JT1078_MAX_RECONNECTS + " reconnects"));
+            return;
         }
         log.info("[{}] reconnect attempt #{} in {}ms", streamId, attempt, delayMs);
         manager.scheduler().schedule(() -> {
@@ -509,11 +654,17 @@ public class StreamSession implements VideoDepacketizer.Listener {
         }, delayMs, TimeUnit.MILLISECONDS);
     }
 
-    private void closeRtspLocked() {
+    /** 调用者持有锁：停止上游拉流（RTSP / JT1078）。 */
+    private void closePullerLocked() {
         RtspClient c = rtspClient;
         rtspClient = null;
         if (c != null) {
             c.stop();
+        }
+        Jt1078HttpPullClient j = jt1078Client;
+        jt1078Client = null;
+        if (j != null) {
+            j.stop();
         }
     }
 
@@ -523,6 +674,32 @@ public class StreamSession implements VideoDepacketizer.Listener {
         currentParams = null;
         muxer = null;
         depacketizer = null;
+        clearFlvPassthroughLocked();
+    }
+
+    /** 调用者持有锁：退出透传模式并释放首屏缓存的 Header 与配置 Tag。 */
+    private void clearFlvPassthroughLocked() {
+        flvPassthrough = false;
+        if (flvHeaderTag != null) {
+            flvHeaderTag.release();
+            flvHeaderTag = null;
+        }
+        if (flvVideoConfigTag != null) {
+            flvVideoConfigTag.release();
+            flvVideoConfigTag = null;
+        }
+        if (flvAudioConfigTag != null) {
+            flvAudioConfigTag.release();
+            flvAudioConfigTag = null;
+        }
+    }
+
+    /** 上游类型标签（日志与监控用）。 */
+    private String upstreamName() {
+        if (!jt1078) {
+            return "RTSP";
+        }
+        return flvPassthrough ? "HTTP-FLV" : "JT1078";
     }
 
     /** 网关停机：关闭所有订阅者与 RTSP。 */
@@ -539,7 +716,7 @@ public class StreamSession implements VideoDepacketizer.Listener {
                 pendingCloseFuture.cancel(false);
                 pendingCloseFuture = null;
             }
-            closeRtspLocked();
+            closePullerLocked();
             cleanupMediaLocked();
             for (Subscriber s : subscribers) {
                 s.markRemoved();
@@ -627,100 +804,210 @@ public class StreamSession implements VideoDepacketizer.Listener {
 
         @Override
         public void onPlaying() {
-            CompletableFuture<Void> f;
-            int total;
-            synchronized (StreamSession.this) {
-                if (state == State.CLOSED) {
-                    return;
-                }
-                state = State.PLAYING;
-                playingSinceMs = System.currentTimeMillis();
-                reconnectAttempts = 0;
-                reconnectScheduled = false;
-                f = startFuture;
-                total = totalSubscribersLocked();
-                if (total == 0) {
-                    onLastSubscriberLeftLocked(); // 启动期间订阅者全部离开
-                }
-            }
-            log.info("[{}] RTSP PLAYING, subscribers={}", streamId, total);
-            if (f != null) {
-                f.complete(null);
-            }
+            handlePlaying();
         }
 
         @Override
         public void onStartupFailure(Throwable cause) {
-            CompletableFuture<Void> f;
-            List<Subscriber> toClose = new ArrayList<>();
-            List<RawSubscriber> toNotify = new ArrayList<>();
-            synchronized (StreamSession.this) {
-                if (state == State.CLOSED) {
-                    return;
-                }
-                state = State.CLOSED;
-                f = startFuture;
-                startFuture = null;
-                if (pendingCloseFuture != null) {
-                    pendingCloseFuture.cancel(false);
-                    pendingCloseFuture = null;
-                }
-                closeRtspLocked();
-                cleanupMediaLocked();
-                for (Subscriber s : subscribers) {
-                    s.markRemoved();
-                    toClose.add(s);
-                }
-                subscribers.clear();
-                subscriberCount = 0;
-                collectAndClearRawLocked(toNotify);
-                manager.removeSession(streamId, StreamSession.this);
-            }
-            log.error("[{}] RTSP startup failed: {}", streamId, String.valueOf(cause.getMessage()));
-            if (f != null) {
-                f.completeExceptionally(cause);
-            }
-            for (Subscriber s : toClose) {
-                closeStream(s.channel(), s.transport(), CLOSE_STREAM_ERROR);
-            }
-            for (RawSubscriber s : toNotify) {
-                notifyStreamClosed(s);
-            }
+            handleStartupFailure(cause);
         }
 
         @Override
         public void onDisconnected(Throwable cause) {
-            boolean reconnect = false;
-            boolean closedNow = false;
+            handleDisconnected(cause);
+        }
+    }
+
+    // ===== 拉流回调共用处理（RTSP / JT1078） =====
+
+    /** 播放开始：切 PLAYING、完成启动 future；启动期间订阅者全部离开则立即收尾。 */
+    private void handlePlaying() {
+        CompletableFuture<Void> f;
+        int total;
+        synchronized (this) {
+            if (state == State.CLOSED) {
+                return;
+            }
+            state = State.PLAYING;
+            playingSinceMs = System.currentTimeMillis();
+            reconnectAttempts = 0;
+            reconnectScheduled = false;
+            urlAttempts = 0;
+            f = startFuture;
+            total = totalSubscribersLocked();
+            if (total == 0) {
+                onLastSubscriberLeftLocked(); // 启动期间订阅者全部离开
+            }
+        }
+        log.info("[{}] {} PLAYING, subscribers={}", streamId, upstreamName(), total);
+        if (f != null) {
+            f.complete(null);
+        }
+    }
+
+    /** 启动失败：终止会话并通知全部订阅者。 */
+    private void handleStartupFailure(Throwable cause) {
+        CompletableFuture<Void> f;
+        List<Subscriber> toClose = new ArrayList<>();
+        List<RawSubscriber> toNotify = new ArrayList<>();
+        synchronized (this) {
+            if (state == State.CLOSED) {
+                return;
+            }
+            state = State.CLOSED;
+            f = startFuture;
+            startFuture = null;
+            if (pendingCloseFuture != null) {
+                pendingCloseFuture.cancel(false);
+                pendingCloseFuture = null;
+            }
+            closePullerLocked();
+            cleanupMediaLocked();
+            for (Subscriber s : subscribers) {
+                s.markRemoved();
+                toClose.add(s);
+            }
+            subscribers.clear();
+            subscriberCount = 0;
+            collectAndClearRawLocked(toNotify);
+            manager.removeSession(streamId, this);
+        }
+        log.error("[{}] {} startup failed: {}", streamId, upstreamName(),
+                String.valueOf(cause.getMessage()));
+        if (f != null) {
+            f.completeExceptionally(cause);
+        }
+        for (Subscriber s : toClose) {
+            closeStream(s.channel(), s.transport(), CLOSE_STREAM_ERROR);
+        }
+        for (RawSubscriber s : toNotify) {
+            notifyStreamClosed(s);
+        }
+    }
+
+    /** 播放中上游断开：有订阅者则调度重连，否则直接终止会话。 */
+    private void handleDisconnected(Throwable cause) {
+        boolean reconnect = false;
+        boolean closedNow = false;
+        synchronized (this) {
+            if (state == State.CLOSED) {
+                return;
+            }
+            rtspClient = null;
+            jt1078Client = null;
+            if (totalSubscribersLocked() > 0 && state == State.PLAYING) {
+                reconnect = !reconnectScheduled;
+                reconnectScheduled = true;
+            } else {
+                // 无订阅者（延迟关闭中）且上游断开：直接终止会话
+                state = State.CLOSED;
+                closedNow = true;
+                if (pendingCloseFuture != null) {
+                    pendingCloseFuture.cancel(false);
+                    pendingCloseFuture = null;
+                }
+                closePullerLocked();
+                cleanupMediaLocked();
+                manager.removeSession(streamId, this);
+            }
+        }
+        if (closedNow) {
+            log.info("[{}] upstream disconnected with no subscribers, session closed: {}",streamId, cause.getMessage());
+        } else {
+            log.warn("[{}] pull disconnected: {}", streamId, cause.getMessage());
+            if (reconnect) {
+                scheduleReconnect();
+            }
+        }
+    }
+
+    /** JT1078 HTTP 拉流回调：无 SDP，响应就绪即按固定 H.264 创建解包器。 */
+    private final class Jt1078Listener implements Jt1078HttpPullClient.Listener {
+
+        @Override
+        public VideoDepacketizer onStreamStarted() {
+            synchronized (StreamSession.this) {
+                if (state == State.CLOSED) {
+                    return null;
+                }
+                clearFlvPassthroughLocked(); // 上游格式可能已变，回到转码封装模式
+                FlvMuxer m = muxer;
+                if (m == null || m.codec() != CodecType.H264) {
+                    m = new FlvMuxer(CodecType.H264, PooledByteBufAllocator.DEFAULT);
+                    muxer = m;
+                } else {
+                    m.onStreamReset(); // 重连：输出时间轴延续递增
+                }
+                gopCache.clear();
+                auGopCache.clear();
+                H264Depacketizer dep = new H264Depacketizer(StreamSession.this);
+                depacketizer = dep;
+                return dep;
+            }
+        }
+
+        /**
+         * 不带 1078 标志（响应体以 FLV Header 开头）：上游已是普通 FLV 视频，
+         * 不再建解包器与封装器，直接按 Tag 透传。
+         */
+        @Override
+        public StreamBodyParser onFlvStreamStarted() {
+            synchronized (StreamSession.this) {
+                if (state == State.CLOSED) {
+                    return null;
+                }
+                muxer = null;
+                depacketizer = null;
+                gopCache.clear();
+                auGopCache.clear();
+                flvPassthrough = true;
+            }
+            log.info("[{}] plain FLV upstream detected, passthrough mode (RTSP forward unavailable)", streamId);
+            return new FlvPassthroughParser(StreamSession.this, PooledByteBufAllocator.DEFAULT);
+        }
+
+        /**
+         * 响应体首字符是 '{'：配置地址是取流接口而非视频流，改用接口给出的地址拉流；
+         * 未解析到地址则 1 秒后重新请求接口。
+         */
+        @Override
+        public void onStreamUrlResolved(String url) {
+            int hops;
             synchronized (StreamSession.this) {
                 if (state == State.CLOSED) {
                     return;
                 }
-                rtspClient = null;
-                if (totalSubscribersLocked() > 0 && state == State.PLAYING) {
-                    reconnect = !reconnectScheduled;
-                    reconnectScheduled = true;
-                } else {
-                    // 无订阅者（延迟关闭中）且上游断开：直接终止会话
-                    state = State.CLOSED;
-                    closedNow = true;
-                    if (pendingCloseFuture != null) {
-                        pendingCloseFuture.cancel(false);
-                        pendingCloseFuture = null;
-                    }
-                    closeRtspLocked();
-                    cleanupMediaLocked();
-                    manager.removeSession(streamId, StreamSession.this);
-                }
+                urlApiMode = true;
+                jt1078Client = null; // 接口拉流实例已结束，避免关闭时重复 stop
+                pullUrl = url;
+                hops = ++urlHops;
             }
-            if (closedNow) {
-                log.info("[{}] upstream disconnected with no subscribers, session closed: {}",streamId, cause.getMessage());
-            } else {
-                log.warn("[{}] RTSP disconnected: {}", streamId, cause.getMessage());
-                if (reconnect) {
-                    scheduleReconnect();
-                }
+            if (url == null) {
+                scheduleUrlRetry();
+                return;
             }
+            if (hops > URL_MAX_HOPS) {
+                handleStartupFailure(new IllegalStateException("stream url api chained over "
+                        + URL_MAX_HOPS + " times"));
+                return;
+            }
+            log.info("[{}] stream url from api: {}", streamId, GatewayConfig.sanitizeUrl(url));
+            startPull(url);
+        }
+
+        @Override
+        public void onPlaying() {
+            handlePlaying();
+        }
+
+        @Override
+        public void onStartupFailure(Throwable cause) {
+            handleStartupFailure(cause);
+        }
+
+        @Override
+        public void onDisconnected(Throwable cause) {
+            handleDisconnected(cause);
         }
     }
 
@@ -788,6 +1075,60 @@ public class StreamSession implements VideoDepacketizer.Listener {
     public void onError(String message) {
         depacketizeErrors.incrementAndGet();
         log.debug("[{}] depacketizer: {}", streamId, message);
+    }
+
+    // ===== FlvPassthroughParser.Listener（普通 FLV 裸流透传，收流 EventLoop 线程回调） =====
+
+    @Override
+    public void onFlvHeader(ByteBuf header) {
+        int len = header.readableBytes();
+        synchronized (this) {
+            if (state == State.CLOSED) {
+                header.release();
+                return;
+            }
+            if (flvHeaderTag != null) {
+                flvHeaderTag.release();
+            }
+            flvHeaderTag = header;
+        }
+        log.info("[{}] passthrough FLV header received, {} bytes", streamId, len);
+    }
+
+    @Override
+    public void onFlvTag(FlvTagKind kind, ByteBuf tag) {
+        try {
+            synchronized (this) {
+                if (state == State.CLOSED) {
+                    return;
+                }
+                boolean keyFrame = kind == FlvTagKind.VIDEO_KEYFRAME;
+                if (kind.config()) {
+                    // 解码配置单独缓存：新订阅者首屏必须先于 GOP 下发
+                    ByteBuf prev = kind == FlvTagKind.VIDEO_CONFIG ? flvVideoConfigTag : flvAudioConfigTag;
+                    if (kind == FlvTagKind.VIDEO_CONFIG) {
+                        flvVideoConfigTag = tag.retain();
+                        paramUpdates.incrementAndGet();
+                    } else {
+                        flvAudioConfigTag = tag.retain();
+                    }
+                    if (prev != null) {
+                        prev.release();
+                    }
+                } else if (kind.video() || kind.audio()) {
+                    gopCache.add(tag, keyFrame);
+                }
+                if (kind.video()) {
+                    if (kind != FlvTagKind.VIDEO_CONFIG) {
+                        framesIn.incrementAndGet();
+                    }
+                    lastFrameAtMs = System.currentTimeMillis();
+                }
+                broadcastLocked(tag, keyFrame || kind.config());
+            }
+        } finally {
+            tag.release();
+        }
     }
 
     // ===== 广播 =====
@@ -928,13 +1269,20 @@ public class StreamSession implements VideoDepacketizer.Listener {
         long bytesIn = 0;
         long lostPkts = 0;
         RtspClient c;
+        Jt1078HttpPullClient j1078;
         VideoDepacketizer dep = depacketizer;
+        String resolved;
         synchronized (this) {
             c = rtspClient;
+            j1078 = jt1078Client;
+            resolved = pullUrl;
         }
         if (c != null) {
             rtpPkts = c.rtpPackets();
             bytesIn = c.rtpBytes();
+        } else if (j1078 != null) {
+            rtpPkts = j1078.frameCount();
+            bytesIn = j1078.byteCount();
         }
         if (dep != null) {
             lostPkts = dep.lostPackets();
@@ -954,7 +1302,9 @@ public class StreamSession implements VideoDepacketizer.Listener {
         return new JsonBuilder(384)
                 .append("streamId", streamId)
                 .append("rtspUrl", GatewayConfig.sanitizeUrl(rtspUrl))
+                .append("resolvedUrl", resolved == null ? "" : GatewayConfig.sanitizeUrl(resolved))
                 .append("state", state.name())
+                .append("upstream", upstreamName())
                 .append("codec", m == null ? "null" : m.codec().name())
                 .append("subscribers", subscriberCount())
                 .append("rtspSubscribers", rawSubscriberCount())
